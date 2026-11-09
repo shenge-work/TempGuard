@@ -1,0 +1,27 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+artifacts/
+*.exe
+*.pdb
+*.msi
+*.cache
+
+# Generated at build time
+src/TempGuard/TempGuard.ico
+
+# Visual Studio / user files
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Logs
+temp_log.csv
+logs/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store

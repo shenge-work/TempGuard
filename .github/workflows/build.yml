@@ -1,0 +1,188 @@
+name: Build installer
+
+# Every push packages a ready-to-install Windows setup exe.
+# Version tags (v*) additionally publish a full GitHub Release with
+# auto-generated, detailed iteration notes.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Override version (e.g. 1.2.0)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  REPO: shenge-work/TempGuard
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout (full history for release notes)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          $base = (Get-Content version.txt -Raw).Trim()
+          $ref  = "${{ github.ref }}"
+          if ("${{ github.event.inputs.version }}" -ne "") {
+            $v = "${{ github.event.inputs.version }}"
+          } elseif ($ref -match '^refs/tags/v(.+)$') {
+            $v = $Matches[1]
+          } else {
+            $v = "$base.${{ github.run_number }}"
+          }
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "BUILD_VERSION=$v"
+
+      - name: Stamp assembly version
+        shell: pwsh
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          $parts = ($v -split '\.')
+          $four = @($parts[0], $(if($parts.Count -gt 1){$parts[1]}else{"0"}),
+                    $(if($parts.Count -gt 2){$parts[2]}else{"0"}),
+                    $(if($parts.Count -gt 3){$parts[3]}else{"0"})) -join '.'
+          $p = "src/TempGuard/Properties/AssemblyInfo.cs"
+          $t = Get-Content $p -Raw
+          $t = $t -replace 'AssemblyVersion\("[^"]+"\)', "AssemblyVersion(`"$four`")"
+          $t = $t -replace 'AssemblyFileVersion\("[^"]+"\)', "AssemblyFileVersion(`"$four`")"
+          [System.IO.File]::WriteAllText((Join-Path (Get-Location) $p), $t, (New-Object System.Text.UTF8Encoding($false)))
+          Write-Host "Stamped $four"
+
+      - name: Generate application icon
+        # Windows PowerShell 5.1 has System.Drawing built in; avoids
+        # System.Drawing.Common availability issues on pwsh/.NET 8.
+        shell: powershell
+        run: .\scripts\New-AppIcon.ps1
+
+      - name: Build TempGuard.exe (Release)
+        shell: pwsh
+        run: |
+          msbuild src/TempGuard/TempGuard.csproj /t:Rebuild /p:Configuration=Release /p:Platform=AnyCPU /m /v:minimal
+          if ($LASTEXITCODE -ne 0) { throw "MSBuild failed with $LASTEXITCODE" }
+          $exe = "src/TempGuard/bin/Release/TempGuard.exe"
+          if (-not (Test-Path $exe)) { throw "TempGuard.exe was not produced" }
+          Write-Host ("EXE_OK: " + (Get-Item $exe).Length + " bytes")
+
+      - name: Ensure Inno Setup is available
+        id: iscc
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+            "C:\Program Files\Inno Setup 6\ISCC.exe"
+          )
+          $iscc = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) {
+            Write-Host "Inno Setup not preinstalled - installing via Chocolatey"
+            choco install innosetup --no-progress -y --allow-empty-checksums
+            $iscc = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $iscc) { throw "ISCC.exe not found after install" }
+          "iscc=$iscc" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "ISCC=$iscc"
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path artifacts -Force | Out-Null
+
+          # Inno Setup 6 reads BOM-less scripts using the system ANSI code page.
+          # Force UTF-8 BOM so the Chinese wizard strings stay intact on CI.
+          $iss = "installer/TempGuard.iss"
+          $issText = [System.IO.File]::ReadAllText((Join-Path (Get-Location) $iss), [System.Text.Encoding]::UTF8)
+          [System.IO.File]::WriteAllText((Join-Path (Get-Location) $iss), $issText, (New-Object System.Text.UTF8Encoding($true)))
+          Write-Host "ISS_UTF8_BOM_READY"
+
+          $v = "${{ steps.ver.outputs.version }}"
+          & "${{ steps.iscc.outputs.iscc }}" `
+            "/DAppVersion=$v" `
+            "/DSourceExe=..\src\TempGuard\bin\Release\TempGuard.exe" `
+            "/DAppIcon=..\src\TempGuard\TempGuard.ico" `
+            "installer\TempGuard.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
+          Get-ChildItem artifacts -File | ForEach-Object {
+            Write-Host ("ARTIFACT: " + $_.Name + " (" + $_.Length + " bytes)")
+          }
+
+      - name: Generate detailed release notes
+        shell: pwsh
+        run: |
+          ./scripts/New-ReleaseNotes.ps1 `
+            -Version "${{ steps.ver.outputs.version }}" `
+            -ArtifactsDir artifacts `
+            -Output artifacts/RELEASE_NOTES.md `
+            -Repository "$env:REPO" `
+            -RunId "${{ github.run_id }}"
+          Get-Content artifacts/RELEASE_NOTES.md -TotalCount 20
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: TempGuard-${{ steps.ver.outputs.version }}
+          path: |
+            artifacts/TempGuard-Setup-*.exe
+            artifacts/RELEASE_NOTES.md
+          retention-days: 90
+
+      - name: Publish tagged Release (stable)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: TempGuard v${{ steps.ver.outputs.version }}
+          body_path: artifacts/RELEASE_NOTES.md
+          files: artifacts/TempGuard-Setup-*.exe
+          draft: false
+          prerelease: false
+          make_latest: true
+
+      - name: Publish rolling dev build (pre-release)
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev
+          name: TempGuard dev build (${{ steps.ver.outputs.version }})
+          body_path: artifacts/RELEASE_NOTES.md
+          files: artifacts/TempGuard-Setup-*.exe
+          draft: false
+          prerelease: true
+          make_latest: false
+
+  # ---------------------------------------------------------------------------
+  # One-time / idempotent repository classification: topics = "tools / utilities".
+  # ---------------------------------------------------------------------------
+  classify:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - name: "Apply repository topics (category: utilities / tools)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          topics='["category-tools","tools","utilities","utility","category-desktop-app","desktop-app","system-tray","category-monitoring","temperature-monitor","hardware-monitoring","thermal-management","category-windows","windows","csharp","dotnet-framework","winforms","lightweight","inno-setup","github-actions"]'
+          printf '{"names":%s}' "$topics" > /tmp/topics.json
+          if gh api --method PUT \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            "/repos/${{ github.repository }}/topics" \
+            --input /tmp/topics.json; then
+            echo "TOPICS_APPLIED"
+          else
+            echo "::warning::Topics need admin rights; apply manually via repo About -> settings."
+          fi
